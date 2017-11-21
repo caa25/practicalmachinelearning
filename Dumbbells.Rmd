@@ -1,0 +1,355 @@
+---
+title: "Dumbbell Lifting the \"Right\" Way"
+author: "Craig Anderson"
+date: "November 19, 2017"
+output:
+  html_document: default
+  pdf_document: default
+---
+```{r echo = FALSE, eval = TRUE, message = FALSE} 
+library(rio)
+library(caret)
+library(parallel)
+library(doParallel)
+library(knitr)
+library(kableExtra)
+library(ggthemes)
+library(grid)
+library(gridExtra)
+library(gtable)
+source("multiplot.R")
+```
+
+###Overview
+Weight lifting has become one of the most popular fitness exercises in the United States, usually in combination with other aerobic routines.  It is also one of the most difficult to coach and monitor as incorrect posture and range of motion can lead to serious injuries.  In this paper, we attempt to use motion metrics from past exercises to predict correct performance.  If we can demonstrate a link between certain motion patterns and future form, individuals can lift with confidence once their form is developed and supervised training is completed.  More specifically, our goal is to determine whether we can reliably predict the manner in which a lift was performed by evaluating range of motion data associated with the lift.  
+
+###DataSets
+The development of new fitness devices such as the Nike Fuelband and Fitbit now allow for the measurement and collection of  a large amount of technical information about range of motion.  For this study, we utilized data observations from accelerometers on the belt, forearm, arm and dumbbells of six individual weightlifting participants.  Each was asked to perform barbell lifts correctly and incorrectly in five different ways and the data measurements were matched to the form evaluations. A comprehensive description of this process can be found [here.](http://groupware.les.inf.puc-rio.br/har)  
+
+We used three datasets in our analysis.  The first is a training dataset consisting of 19,622 observations of 160 variables, available [here.](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv)  To faciliate our model development, we partitioned this dataset into two subsets: a training dataset consisting of 11,776 observations (60%) for use in developing our prediction model and a validation dataset consisting of 7,846 observations (40%) which we used to validate the accuracy of our model.  The final dataset is a testing dataset found [here.](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv)  This set consists of 20 observations of the same 160 variables.  Our goal is to correctly predict the manner in which the testing dataset lifts were performed by analyzing the range of motion data in these 20 observations using the model we develop from the training set.
+
+All code for downloading and partitioning the datasets is set forth in the Appendix.
+
+```{r echo = FALSE, eval = TRUE}
+## Download Training Data Source File
+if (!file.exists("pml-training.csv")) {
+    download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+                  "pml-training.csv")
+}
+
+## Download Testing Data Source File
+if (!file.exists("pml-testing.csv")) {
+    download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+                  "pml-testing.csv")
+}
+
+## Load files into R session and split for training
+trainingSet <- import("pml-training.csv", na.strings = c("NA", " ", "", "NULL"))
+inTrain <- createDataPartition(trainingSet$classe, p = 0.6, list = FALSE)
+training   <- trainingSet[ inTrain, ]
+validation <- trainingSet[-inTrain, ]
+testing  <- import("pml-testing.csv", na.strings = c("NA", " ", "", "NULL"))
+```
+
+###Dataset Review
+After several tests of the datasets, we made two adjustments:
+
+1. **Missing Data.** We analyzed the datasets for missing data and found that approximately **61%** of the data was missing in all three datasets.  Because missing data can distort the fitting process and because the missing data is matched in the three datasets, we decided to eliminate the variables with missing data from our model fits.
+
+2. **Personalized Data.** We also found that the first seven variables relate to participant identification and time data that could potentially distort a prediction model built for range of motion data.  We also removed these variables.
+
+```{r echo = FALSE, eval = TRUE}
+## Remove NA value variables
+naCols <- sapply(names(training), function(x){ all(is.na(training[,x]) == FALSE)})
+vars <- names(naCols)[naCols == TRUE]
+
+## Remove participant identification and time variables
+vars <- vars[-(1:7)]
+```
+
+The adjustment code is in the Appendix.  These adjustments left us with 52 analysis variables plus the classe evaluation result in our model training and validation sets.  Because data transformations are less important in the non-linear classification models we used, we did not further transform any variables.
+
+```{r echo = FALSE, eval = TRUE, message = FALSE}
+## Create Dimension Table
+dimensionMatch <- rbind(dim(training[ , vars]), dim(validation[ , vars]), dim(testing))
+colnames(dimensionMatch) <- c("Observations", "Variables")
+rownames(dimensionMatch) <- c("Training Set", "Validation Set", "Testing Set")
+kable(dimensionMatch) %>% 
+    kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+```
+
+###Model Building
+Based on the asymmetical nature of weight lifting movements, the resulting non-normal distribution of the variables, and the nature of attempting to predict classification results among factorized outcomes, we decided to evaluate nonparametric models and selected the random forest decision tree and the gmb stochastic gradient boosting models.  In our analysis, we resampled and used k 10-fold cross validation.  Both models were run with parallel processing enabled.  The model fitting code is in the Appendix.  The following table summarizes the fit accuracy of the two models:
+
+```{r echo = FALSE, eval = TRUE, cache = TRUE}
+## Set parallel processing
+cluster <- makeCluster(detectCores() - 2) # 12 core machine;  Leave 2 for background OS
+registerDoParallel(cluster)
+fitControl <- trainControl(method = "cv",   ## k-fold cross validation
+                           number = 10,     ## number of folds; 10 is the default
+                           allowParallel = TRUE)
+
+## Fit Models
+set.seed(3446)
+
+rfModel  <- train(classe ~ ., data = training[ , vars], method = "rf", 
+                  trControl = fitControl, prox = TRUE, importance = TRUE)
+
+gbmModel <- train(classe ~ ., data = training[ , vars], method = "gbm", 
+                  trControl = fitControl, verbose = FALSE)
+
+## Halt parallel processing
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+```{r echo = FALSE, eval = TRUE, message = FALSE}
+fitResults <- rbind(round(rfModel$results[1, 2],4), round(gbmModel$results[9, 5], 4))
+colnames(fitResults) <- "Fit.Accuracy"
+rownames(fitResults) <- c("Random Forest", "Gradient Boosting")
+kable(fitResults) %>% 
+    kable_styling(bootstrap_options = "condensed", full_width = FALSE) 
+```
+
+Both models are fairly accurate.  The random forest model has a pronounced accuracy edge based on the training data fit. This can also be seen in the following graphs of the accuracy cross validation progress of the models:
+
+```{r  echo = FALSE, message = FALSE, warning = FALSE}
+plot1 <-ggplot(rfModel) +
+    ggtitle("Random Forest") + 
+    labs(x = "Random Variables", y = "Accuracy(Cross-Validation)") +
+    theme_economist()                                +
+    theme(axis.text.x  = element_text(face = "bold"),
+          axis.title.x = element_text(face = "bold"),
+          axis.text.y  = element_text(face = "bold"))
+
+plot2 <- ggplot(gbmModel) +
+    ylim(0.75, 0.99) +
+    ggtitle("gbm Boosting") + 
+    labs(x = "Boosting Iterations") +
+    theme_economist()                                +
+    theme(legend.position = "right",
+          axis.text.x  = element_text(face = "bold"),
+          axis.title.x = element_text(face = "bold"),
+          axis.text.y  = element_text(face = "bold"))
+
+multiplot(plot1, plot2, cols = 2)
+```
+
+
+###Model Evaluation
+We established our valuation dataset so that we could test our models for possible out of sample errors and accuracy.  The following summary table shows that both models also validate at very high accuracy rates.  The random forest model maintains its accuracy advantage over the boost model.  
+
+```{r echo = FALSE, eval = TRUE}
+## Model Validation
+rfValidation <- predict(rfModel, validation)
+rfValidationCM <- confusionMatrix(rfValidation, validation$classe)
+
+gbmValidation <- predict(gbmModel, validation)
+gbmValidationCM <- confusionMatrix(gbmValidation, validation$classe)
+```
+
+```{r echo = FALSE, eval = TRUE, message = FALSE}
+validationResults <- rbind(round( rfValidationCM$overall[1], 4), 
+                           round(gbmValidationCM$overall[1], 4))
+colnames(validationResults) <- "Validation.Accuracy" 
+rownames(validationResults) <- c("Random Forest", "Gradient Boosting") 
+kable(as.data.frame(validationResults)) %>% 
+    kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+```
+
+This is confirmed by the prediction tables for both models:  
+
+```{r echo = FALSE, message = FALSE, fig.height = 2 }
+t1 <- tableGrob(rfValidationCM$table)
+rftitle <- textGrob("Random Forest",gp = gpar(fontsize = 16))
+padding <- unit(5,"mm")
+rfTable <- gtable_add_rows(t1, heights = grobHeight(rftitle) + padding, pos = 0)
+rfTable <- gtable_add_grob( rfTable, rftitle, 1, 1, 1, ncol(rfTable))
+
+t2 <- tableGrob(gbmValidationCM$table)
+gbmtitle <- textGrob("gbm Boost",gp = gpar(fontsize = 16))
+padding <- unit(5,"mm")
+gbmTable <- gtable_add_rows(t2, heights = grobHeight(gbmtitle) + padding, pos = 0)
+gbmTable <- gtable_add_grob( gbmTable, gbmtitle, 1, 1, 1, ncol(gbmTable))
+
+grid.arrange(rfTable, gbmTable, ncol = 2)
+```
+
+Our conclusion is that the random forest model is more accurate than the gbm boost model.  Again, all code is found in the Appendix. 
+ 
+###Prediction
+The final step in our analysis is predicting the test data results.  We used our random forest model because it has an accuracy advantage over the boosting model.  Our predictions are as follows:
+
+```{r echo = FALSE, eval = TRUE, message = FALSE}
+Test.Prediction <- predict(rfModel, testing)
+Test.Prediction <- t(as.data.frame(Test.Prediction ))
+colnames(Test.Prediction ) <- c(1:20)
+kable(Test.Prediction )
+```
+
+The prediction code is found at the end of the Appendix.
+
+###Conclusion
+We believe that we can reliably predict the manner in which a lift was performed by evaluating range of motion data associated with the lift using our random forest prediction model.  We expect a 99%+ accuracy from the model.
+
+The high level of confidence we have in our model suggests the possibility that the measuring devices could be programmed to issue warnings when proper form is not being followed.  This is definately worth further exploration, but is beyond the scope of our current study.
+ 
+ 
+\newpage
+
+#Appendix
+
+This appendix contains the r code and related information for the attached analysis.
+
+```{r setup, echo = TRUE, eval = FALSE}
+library(rio)
+library(caret)
+library(parallel)
+library(doParallel)
+library(knitr)
+library(kabelExtra)
+library(grid)
+library(ggthemes)
+library(gridExtra)
+library(gtable)
+source("multiplot.R")
+```
+###Dataset Construction 
+```{r datasets, echo = TRUE, eval = FALSE}
+## Download Training Data Source File
+if (!file.exists("pml-training.csv")) {
+    download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+                  "pml-training.csv")
+}
+
+## Download Testing Data Source File
+if (!file.exists("pml-testing.csv")) {
+    download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+                  "pml-testing.csv")
+}
+
+## Load files into R session and split for training
+trainingSet <- import("pml-training.csv", na.strings = c("NA", " ", "", "NULL"))
+inTrain <- createDataPartition(trainingSet$classe, p = 0.6, list = FALSE)
+training   <- trainingSet[ inTrain, ]
+validation <- trainingSet[-inTrain, ]
+testing  <- import("pml-testing.csv", na.strings = c("NA", " ", "", "NULL"))
+``` 
+###Dataset Adjustments
+```{r carpentry, echo = TRUE, eval = FALSE}
+## Remove NA data
+naTable <- rbind(c(dim(training)[2],round(mean(is.na(training)),3)),
+                 c(dim(validation)[2],round(mean(is.na(validation)),3)),
+                 c(dim(testing)[2],round(mean(is.na(testing)),3)))
+colnames(naTable) <- c("Variables", "Percent.NA")
+rownames(naTable) <- c("Training", "Validation", "Testing")
+
+naCols <- sapply(names(training), function(x){ all(is.na(training[,x]) == FALSE)})
+vars <- names(naCols)[naCols == TRUE]
+
+## Remove participant identification and time variables
+vars <- vars[-(1:7)]
+
+## Create Dimension Table
+dimensionMatch <- rbind(dim(training), dim(validation), dim(testing))
+colnames(dimensionMatch) <- c("Observations", "Variables")
+rownames(dimensionMatch) <- c("Training", "Validation", "Testing")
+dimensionMatch
+```
+###Prediction Model Fitting
+```{r models, echo = TRUE, eval = FALSE, cache = TRUE}
+## Set parallel processing
+cluster <- makeCluster(detectCores() - 2) # 12 core machine;  Leave 2 for background OS
+registerDoParallel(cluster)
+fitControl <- trainControl(method = "cv",   ## k-fold cross validation
+                           number = 10,     ## number of folds; 10 is the default
+                           allowParallel = TRUE)
+
+## Fit Models
+set.seed(3446)
+
+rfModel  <- train(classe ~ ., data = training[ , vars], method = "rf", 
+                  trControl = fitControl, prox = TRUE, importance = TRUE)
+
+gbmModel <- train(classe ~ ., data = training[ , vars], method = "gbm", 
+                  trControl = fitControl, verbose = FALSE)
+
+## Halt parallel processing
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+```{r fittable, echo = TRUE, eval = FALSE}
+fitResults <- rbind(round(rfModel$results[1, 2],4), round(gbmModel$results[9, 5], 4))
+colnames(fitResults) <- "Fit.Accuracy"
+rownames(fitResults) <- c("Random Forest", "Gradient Boosting")
+fitResults
+```
+
+```{r  accuracyplots, echo = FALSE, eval = FALSE}
+plot1 <-ggplot(rfModel) +
+    ggtitle("Random Forest") + 
+    labs(x = "Random Variables", y = "Accuracy(Cross-Validation)") +
+    theme_economist()                                +
+    theme(axis.text.x  = element_text(face = "bold"),
+          axis.title.x = element_text(face = "bold"),
+          axis.text.y  = element_text(face = "bold"))
+
+plot2 <- ggplot(gbmModel) +
+    ylim(0.75, 0.99) +
+    ggtitle("gbm Boosting") + 
+    labs(x = "Boosting Iterations") +
+    theme_economist()                                +
+    theme(legend.position = "right",
+          axis.text.x  = element_text(face = "bold"),
+          axis.title.x = element_text(face = "bold"),
+          axis.text.y  = element_text(face = "bold"))
+
+multiplot(plot1, plot2, cols = 2)
+```
+
+###Prediction Model Validation Analysis
+```{r validation, echo = TRUE, eval = TRUE}
+## Model Validation
+rfValidation <- predict(rfModel, validation)
+rfValidationCM <- confusionMatrix(rfValidation, validation$classe)
+
+gbmValidation <- predict(gbmModel, validation)
+gbmValidationCM <- confusionMatrix(gbmValidation, validation$classe)
+```
+
+```{r validationtable, echo = TRUE, eval = FALSE}
+## Build validation accuracy reporting table
+validationResults <- rbind(round(rfValidationCM$overall[1],4), 
+                           round(gbmValidationCM$overall[1], 4))
+colnames(validationResults) <- "Validation.Accuracy" 
+rownames(validationResults) <- c("Random Forest", "Gradient Boosting") 
+validationResults
+```
+
+```{r predictiontable, echo = TRUE, eval = FALSE, message = FALSE, fig.height = 2 }
+## Build prediction comparison table 
+t1 <- tableGrob(rfValidationCM$table)
+rftitle <- textGrob("Random Forest",gp = gpar(fontsize = 16))
+padding <- unit(5,"mm")
+rfTable <- gtable_add_rows(t1, heights = grobHeight(rftitle) + padding, pos = 0)
+rfTable <- gtable_add_grob( rfTable, rftitle, 1, 1, 1, ncol(rfTable))
+
+t1 <- tableGrob(gbmValidationCM$table)
+gbmtitle <- textGrob("gbm Boost",gp = gpar(fontsize = 16))
+padding <- unit(5,"mm")
+gbmTable <- gtable_add_rows(t1, heights = grobHeight(gbmtitle) + padding, pos = 0)
+gbmTable <- gtable_add_grob( gbmTable, rftitle, 1, 1, 1, ncol(gbmTable))
+
+grid.arrange(rfTable, gbmTable, ncol = 2)
+```
+
+###Prediction
+```{r prediction, echo = TRUE, eval = FALSE}
+Test.Prediction <- predict(rfModel, testing)
+Test.Prediction <- t(as.data.frame(Test.Prediction ))
+colnames(Test.Prediction ) <- c(1:20)
+kable(Test.Prediction )
+```
+
+
